@@ -1,0 +1,144 @@
+# Sets up the Quantitative Signal Discovery Agent blueprint with uv, smoke-runs
+# the `nat` workflow against hosted NVIDIA inference, then runs the QSD CLI test
+# suite from the shared QA image. This blueprint is pure Python (uv + nvidia-nat)
+# and calls hosted inference (build.nvidia.com), so no local GPU is required.
+#
+# Required repository secrets:
+#   NVIDIA_API_KEY         build.nvidia.com API key (nvapi-...) used by the
+#                          `nat` workflow to call hosted inference.
+#   TEST_DOCKER_PULL_KEY   NVIDIA API key with pull access to
+#                          nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image.
+#                          If unset, the test step is skipped.
+#
+# Optional SMTP secrets (mail step skipped if any are missing):
+#   SMTP_USERNAME, SMTP_PASSWORD, SMTP_MAIL_TO, SMTP_MAIL_FROM
+
+name: Blueprint QA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quantitative-signal-discovery-cli:
+    name: Quantitative Signal Discovery Agent CLI
+    # No GPU needed (hosted inference). Swap to an org runner if registry /
+    # network access to nvcr.io requires a self-hosted runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      QA_TEST_IMAGE: nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image:latest
+      QSD_CONFIG: configs/config-optimization.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up blueprint (uv + data)
+        run: |
+          set -euo pipefail
+          : "${NVIDIA_API_KEY:?NVIDIA_API_KEY secret missing}"
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --locked
+          # Download the S&P 500 price/volume dataset the workflow analyses.
+          uv run python -m signal_discovery_workflow.download_data
+
+      - name: Smoke-run the signal discovery workflow
+        run: |
+          set -euo pipefail
+          uv run nat run --config_file "${QSD_CONFIG}" --input "momentum signals" | tee nat-smoke.log
+          grep -q "Workflow Result:" nat-smoke.log
+
+      - name: Run QSD CLI tests
+        env:
+          TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${TEST_DOCKER_PULL_KEY:-}" ] || exit 0
+          echo "${TEST_DOCKER_PULL_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          docker pull "${QA_TEST_IMAGE}"
+          # The QA suite lives at /app inside the image (built from `main`), while
+          # the blueprint checkout is mounted at /blueprint. We `uv sync` inside the
+          # container so the `nat` binary + deps live in the same environment the
+          # subprocess runs in, and keep the container cwd at /blueprint so `nat`
+          # resolves the downloaded dataset. pytest itself is the image's harness
+          # pytest (playwright/etc.), invoked against the /app test tree.
+          docker run --rm \
+            -e NVIDIA_API_KEY \
+            -v "$(pwd):/blueprint" \
+            -w /blueprint \
+            "${QA_TEST_IMAGE}" bash -lc '
+              set -euo pipefail
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+              export PATH="$HOME/.local/bin:$PATH"
+              uv sync --locked
+              pytest /app/testcases/quantitative_signal_discovery_agent \
+                -m "quantitative_signal_discovery_agent and cli" \
+                --nat-binary=/blueprint/.venv/bin/nat \
+                --qsd-config-optimization=/blueprint/configs/config-optimization.yml \
+                --reruns=2 --reruns-delay=15 \
+                --disable-warnings -v --timeout=600 \
+                --html=/blueprint/qsd-cli-test.html --self-contained-html
+            '
+
+      - name: Capture failure diagnostics
+        if: failure()
+        run: |
+          mkdir -p ci-diagnostics
+          cp nat-smoke.log ci-diagnostics/ 2>/dev/null || true
+          uv run pip list > ci-diagnostics/pip-list.txt 2>&1 || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantitative-signal-discovery-cli-test
+          path: |
+            qsd-cli-test.html
+            nat-smoke.log
+            ci-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rmi "${QA_TEST_IMAGE}" 2>/dev/null || true
+          docker image prune -f 2>/dev/null || true
+
+      - name: Detect SMTP
+        id: smtp
+        if: always()
+        env:
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_MAIL_TO: ${{ secrets.SMTP_MAIL_TO }}
+          SMTP_MAIL_FROM: ${{ secrets.SMTP_MAIL_FROM }}
+        run: |
+          [ -n "${SMTP_USERNAME:-}${SMTP_PASSWORD:-}${SMTP_MAIL_TO:-}${SMTP_MAIL_FROM:-}" ] \
+            && [ -n "${SMTP_USERNAME:-}" ] && [ -n "${SMTP_PASSWORD:-}" ] \
+            && [ -n "${SMTP_MAIL_TO:-}" ] && [ -n "${SMTP_MAIL_FROM:-}" ] \
+            && echo "enabled=true" >> "$GITHUB_OUTPUT" \
+            || echo "enabled=false" >> "$GITHUB_OUTPUT"
+
+      - name: Send mail
+        if: always() && steps.smtp.outputs.enabled == 'true'
+        uses: dawidd6/action-send-mail@6e71c855c9a091d80a519621b9fd3e8d252ca40c
+        continue-on-error: true
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "QA Test Workflow Result for ${{ github.repository }}"
+          to: ${{ secrets.SMTP_MAIL_TO }}
+          from: ${{ secrets.SMTP_MAIL_FROM }}
+          html_body: |
+            <p>Workflow for <strong>${{ github.repository }}</strong> finished: <strong>${{ job.status }}</strong></p>
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View run</a></p>
