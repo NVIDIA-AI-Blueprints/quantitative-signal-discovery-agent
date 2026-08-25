@@ -3,31 +3,18 @@
 # hosted NVIDIA inference (build.nvidia.com); it has NO deployable server /
 # docker-compose stack, so its "deployment" is simply `uv sync` + dataset download.
 #
-# Two things run here, both inside the QA image with the blueprint checkout mounted
-# at /blueprint and the QA harness at /app:
-#   1. CLI tests      - run `nat run` for the four documented factor prompts and
-#                       assert on each "Workflow Result:" payload.
+# CLI and notebook run in a SINGLE container / SINGLE pytest session so the heavy
+# setup happens once (one image pull, one `uv sync`, one dataset download, one
+# editable install) instead of being duplicated per suite:
+#   1. CLI tests      - `nat run` for the four documented factor prompts, asserting
+#                       on each "Workflow Result:" payload.
 #   2. Notebook test  - execute the SHIPPED notebook
 #                       (notebooks/signal-discovery-workflow.ipynb) end-to-end with
-#                       nbconvert, export HTML, and assert on the nat-run cell's
-#                       "Workflow Result:" output. This exercises the real notebook
-#                       instead of a stale fixture. The generated HTML is dropped
-#                       into /app/input where the harness notebook test expects it
-#                       (the QA image ships no input/ fixtures - the Dockerfile
-#                       strips them - so we produce it live).
-#
-# Design goals:
-#   * Full   - CLI covers every documented factor scenario; the notebook test
-#              covers the shipped notebook's live nat run.
-#   * Strict - pytest runs without masking its exit code; each case asserts on the
-#              "Workflow Result:" payload (status/iteration/saved_path non-empty,
-#              mean_ic numeric), so a broken/empty result fails.
-#   * Stable - the no-telemetry config is used everywhere (no flaky Phoenix/OTLP
-#              exporter); the notebook is executed with --allow-errors so optional
-#              cells (e.g. the Phoenix UI helper) can't abort the run while the
-#              pytest assertion still gates the real result; transient LLM/network
-#              hiccups are retried; all steps share one container environment and
-#              the mounted /blueprint (venv + dataset persist across steps).
+#                       nbconvert, export HTML, and assert on the executed cells.
+#                       This exercises the real notebook instead of a stale fixture.
+#                       The generated HTML is dropped into /app/input where the
+#                       harness notebook test expects it (the QA image ships no
+#                       input/ fixtures - the Dockerfile strips them).
 #
 # Required repository secrets:
 #   NVIDIA_API_KEY         build.nvidia.com API key (nvapi-...) used by nat.
@@ -66,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run Quantitative Signal Discovery CLI tests
+      - name: Run Quantitative Signal Discovery tests (CLI + notebook)
         env:
           TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
         run: |
@@ -76,108 +63,70 @@ jobs:
           echo "${TEST_DOCKER_PULL_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
           docker pull "${QA_TEST_IMAGE}"
 
-          # Everything runs inside the QA image so nat + its deps live in the same
-          # environment the test subprocess uses. The blueprint checkout is mounted
-          # at /blueprint; the QA test harness lives at /app inside the image.
-          docker run --rm \
+          # One container for both suites. The blueprint checkout is mounted at
+          # /blueprint; the QA harness lives at /app inside the image. nat + its
+          # deps live in the same environment the tests use.
+          # Script is piped into the container via a quoted heredoc (bash -s), so
+          # any quoting/apostrophes inside it are worry-free. $HOME/$PATH and
+          # ${QSD_CONFIG}/$NVIDIA_API_KEY stay literal here and expand inside the
+          # container; $(pwd) is expanded by the runner for the bind mount.
+          docker run --rm -i \
             -e NVIDIA_API_KEY \
             -e QSD_CONFIG \
             -v "$(pwd):/blueprint" \
-            "${QA_TEST_IMAGE}" bash -lc '
-              set -euo pipefail
-
-              # /blueprint is owned by the runner user but the container runs as
-              # root; allow git introspection during the editable build.
-              git config --global --add safe.directory /blueprint
-
-              curl -LsSf https://astral.sh/uv/install.sh | sh
-              export PATH="$HOME/.local/bin:$PATH"
-
-              cd /blueprint
-              uv sync --locked
-              # Download the S&P 500 price/volume dataset the workflow analyses
-              # (nat loads it via the editable package, so it resolves regardless
-              # of the test process cwd). Persisted on the mounted volume, so the
-              # notebook step below reuses it and skips the slow Yahoo download.
-              uv run python -m signal_discovery_workflow.download_data
-
-              # Run pytest from /app: the harness conftest pytest_configure greps
-              # "testcases/" relative to cwd to build the markers file, so cwd MUST
-              # be the harness root (/app). nat + config are passed as absolute
-              # paths, so they work from any cwd. This mirrors how TestWave runs.
-              cd /app
-              pytest testcases/quantitative_signal_discovery_agent \
-                -m "quantitative_signal_discovery_agent and cli" \
-                --nat-binary=/blueprint/.venv/bin/nat \
-                --qsd-config-optimization="/blueprint/${QSD_CONFIG}" \
-                --reruns=2 --reruns-delay=30 \
-                --disable-warnings -v --timeout=900 \
-                --html=/blueprint/qsd-cli-test.html --self-contained-html
-            '
-
-      - name: Run Quantitative Signal Discovery notebook test
-        # Always run so a CLI failure does not hide the notebook result; the job
-        # still fails overall if either step fails.
-        if: always()
-        env:
-          TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
-        run: |
+            "${QA_TEST_IMAGE}" bash -s <<'DOCKER_SCRIPT'
           set -euo pipefail
-          : "${NVIDIA_API_KEY:?NVIDIA_API_KEY secret missing}"
-          [ -n "${TEST_DOCKER_PULL_KEY:-}" ] || { echo "TEST_DOCKER_PULL_KEY unset; skipping."; exit 0; }
-          echo "${TEST_DOCKER_PULL_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
-          docker pull "${QA_TEST_IMAGE}"
 
-          docker run --rm \
-            -e NVIDIA_API_KEY \
-            -v "$(pwd):/blueprint" \
-            "${QA_TEST_IMAGE}" bash -lc '
-              set -euo pipefail
+          # /blueprint is owned by the runner user but the container runs as root;
+          # allow git introspection during the editable build.
+          git config --global --add safe.directory /blueprint
 
-              git config --global --add safe.directory /blueprint
-              curl -LsSf https://astral.sh/uv/install.sh | sh
-              export PATH="$HOME/.local/bin:$PATH"
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
 
-              cd /blueprint
-              # --extra test pulls the notebook toolchain the notebook itself uses;
-              # add nbconvert/ipykernel defensively in case they are not in the lock.
-              uv sync --locked --extra test
-              uv pip install --quiet nbconvert nbclient ipykernel
-              uv run python -m ipykernel install --user --name python3 --display-name python3
+          cd /blueprint
+          # --extra test pulls the notebook toolchain the notebook itself uses; add
+          # nbconvert/ipykernel defensively in case they aren't in the lock.
+          uv sync --locked --extra test
+          uv pip install --quiet nbconvert nbclient ipykernel
+          uv run python -m ipykernel install --user --name python3 --display-name python3
 
-              # Ensure the dataset exists (reused from the CLI step via the mount;
-              # re-download only if missing).
-              uv run python -m signal_discovery_workflow.download_data
+          # Download the S&P 500 dataset once (nat loads it via the editable package,
+          # so it resolves regardless of the test process cwd).
+          uv run python -m signal_discovery_workflow.download_data
 
-              # Execute the shipped notebook end-to-end and export HTML.
-              # --allow-errors keeps optional cells from aborting the run: the
-              # notebook tries to start a local Phoenix collector, which may be
-              # absent - the nat-run cell still prints its "Workflow Result:"
-              # payload even if telemetry export fails, and the pytest assertion
-              # below is what actually gates that result. The notebook self-syncs
-              # and chdirs to the repo root, so relative configs/ and src/ paths
-              # resolve regardless of the kernel's starting directory.
-              uv run python -m nbconvert --to html --execute --allow-errors \
-                --ExecutePreprocessor.timeout=1800 \
-                --ExecutePreprocessor.kernel_name=python3 \
-                --output signal-discovery-workflow.html \
-                --output-dir /blueprint \
-                notebooks/signal-discovery-workflow.ipynb
+          # Execute the shipped notebook end-to-end and export HTML. --allow-errors
+          # keeps optional cells (e.g. the Phoenix UI helper) from aborting the run;
+          # the run cell still prints its "Workflow Result:" payload even if telemetry
+          # export fails, and the pytest assertion gates that result. The trailing
+          # "|| true" means a notebook hiccup doesn't block the CLI suite - the
+          # notebook cases fail clearly if the HTML is missing. The notebook self-syncs
+          # and chdirs to the repo root, so relative configs/ and src/ paths resolve.
+          uv run python -m nbconvert --to html --execute --allow-errors \
+            --ExecutePreprocessor.timeout=1800 \
+            --ExecutePreprocessor.kernel_name=python3 \
+            --output signal-discovery-workflow.html \
+            --output-dir /blueprint \
+            notebooks/signal-discovery-workflow.ipynb || true
 
-              # Drop the exported HTML where the harness notebook test expects it
-              # (WORKSPACE/input/...). WORKSPACE resolves to cwd, and we run pytest
-              # from /app below, so place it under /app/input.
-              mkdir -p /app/input/quantitative_signal_discovery_agent
-              cp /blueprint/signal-discovery-workflow.html \
-                 /app/input/quantitative_signal_discovery_agent/signal-discovery-workflow.html
+          # Drop the exported HTML where the harness notebook test expects it
+          # (WORKSPACE/input/...); WORKSPACE resolves to cwd = /app below.
+          mkdir -p /app/input/quantitative_signal_discovery_agent
+          cp /blueprint/signal-discovery-workflow.html \
+             /app/input/quantitative_signal_discovery_agent/signal-discovery-workflow.html || true
 
-              cd /app
-              pytest testcases/quantitative_signal_discovery_agent/test_quantitative_signal_discovery_notebook.py \
-                -m "quantitative_signal_discovery_agent and notebook" \
-                --reruns=1 --reruns-delay=10 \
-                --disable-warnings -v --timeout=300 \
-                --html=/blueprint/qsd-notebook-test.html --self-contained-html
-            '
+          # Single pytest session for BOTH suites. Run from /app (harness root) so the
+          # conftest marker grep over testcases/ + data/ works. nat + config are
+          # absolute paths, so they work from any cwd.
+          cd /app
+          pytest testcases/quantitative_signal_discovery_agent \
+            -m "quantitative_signal_discovery_agent and (cli or notebook)" \
+            --nat-binary=/blueprint/.venv/bin/nat \
+            --qsd-config-optimization="/blueprint/${QSD_CONFIG}" \
+            --reruns=1 --reruns-delay=20 \
+            --disable-warnings -v --timeout=900 \
+            --html=/blueprint/qsd-test.html --self-contained-html
+          DOCKER_SCRIPT
 
       - name: Capture failure diagnostics
         if: failure()
@@ -192,8 +141,7 @@ jobs:
         with:
           name: quantitative-signal-discovery-test
           path: |
-            qsd-cli-test.html
-            qsd-notebook-test.html
+            qsd-test.html
             signal-discovery-workflow.html
             ci-diagnostics/
           if-no-files-found: ignore
