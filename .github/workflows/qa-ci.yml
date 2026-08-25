@@ -1,33 +1,36 @@
-# Runs the Quantitative Signal Discovery Agent CLI test suite from the shared QA
-# image. This blueprint is pure Python (uv + nvidia-nat) and calls hosted NVIDIA
-# inference (build.nvidia.com), so no local GPU is required.
+# Full QA for the Quantitative Signal Discovery Agent blueprint, run from the
+# shared QA image. This blueprint is pure Python (uv + nvidia-nat) and calls
+# hosted NVIDIA inference (build.nvidia.com); it has NO deployable server /
+# docker-compose stack, so its "deployment" is simply `uv sync` + dataset
+# download. The job therefore has three phases:
 #
-# Design goals: full coverage, strict assertions, stable in CI.
-#   * Full   - runs every CLI scenario the blueprint documents (momentum /
-#              volatility / mean-reversion / volume-price divergence).
-#   * Strict - pytest runs without swallowing its exit code; each case asserts on
-#              the "Workflow Result:" payload (status/iteration/saved_path present
-#              and non-empty, mean_ic numeric) via the YAML test spec, so a
-#              broken/empty result fails the job.
-#   * Stable - uses the no-telemetry config (no flaky Phoenix/OTLP exporter),
-#              tolerates only nat's unreliable process exit code (handled per-case
-#              by skip_exit_code_check in the YAML, not by masking pytest),
-#              retries transient LLM/network hiccups, and does all setup + test in
-#              a single container environment (no cross-env venv drift).
+#   1. Set up (deploy-equivalent) - uv sync + download the S&P 500 dataset.
+#   2. CLI tests   - run every documented `nat run` scenario (momentum /
+#                    volatility / mean-reversion / volume-price divergence) and
+#                    assert on the "Workflow Result:" payload.
+#   3. Notebook tests - validate the committed exported-notebook HTML fixture
+#                    (input/.../factor-mining-workflow.html) for the same
+#                    scenarios. Static fixture, no inference needed.
+#
+# Strict + stable:
+#   * pytest runs without masking its exit code; the job fails if any case fails.
+#   * Content is asserted (status/iteration/saved_path non-empty, mean_ic numeric)
+#     via the YAML specs, so a broken/empty result fails.
+#   * Uses the no-telemetry config (no flaky Phoenix/OTLP exporter). Only nat's
+#     unreliable process exit code is tolerated, per-case via skip_exit_code_check
+#     in the YAML - never at the pytest level.
+#   * Transient LLM/network hiccups are retried; all setup + tests share one
+#     container environment (no cross-env venv drift).
 #
 # Required repository secrets:
-#   NVIDIA_API_KEY         build.nvidia.com API key (nvapi-...) used by nat to
-#                          call hosted inference.
-#   TEST_DOCKER_PULL_KEY   NVIDIA API key with pull access to
-#                          nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image.
-#                          If unset, the test step is skipped.
-#
+#   NVIDIA_API_KEY         build.nvidia.com API key (nvapi-...) used by nat.
+#   TEST_DOCKER_PULL_KEY   NVIDIA API key with pull access to the QA image.
+#                          If unset, the job is skipped.
 # Optional SMTP secrets (mail step skipped if any are missing):
 #   SMTP_USERNAME, SMTP_PASSWORD, SMTP_MAIL_TO, SMTP_MAIL_FROM
 #
 # Note: the QA image ':latest' is built from 'main', so the
-# quantitative_signal_discovery_agent tests + their conftest options
-# (--nat-binary, --qsd-config-optimization) must be merged to main first.
+# quantitative_signal_discovery_agent tests + conftest options must be on main.
 
 name: Blueprint QA
 
@@ -41,8 +44,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  quantitative-signal-discovery-cli:
-    name: Quantitative Signal Discovery Agent CLI
+  quantitative-signal-discovery:
+    name: Quantitative Signal Discovery Agent QA
     # No GPU needed (hosted inference). Swap to an org runner if registry /
     # network access to nvcr.io requires a self-hosted runner.
     runs-on: ubuntu-latest
@@ -56,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run Quantitative Signal Discovery CLI tests
+      - name: Run QA (setup + CLI + notebook)
         env:
           TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
         run: |
@@ -66,48 +69,73 @@ jobs:
           echo "${TEST_DOCKER_PULL_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
           docker pull "${QA_TEST_IMAGE}"
 
-          # Everything runs inside the QA image so nat + its deps live in the same
-          # environment the test subprocess uses. The blueprint checkout is mounted
-          # at /blueprint; the QA test harness lives at /app inside the image.
+          # Everything runs inside the QA image: the blueprint checkout is mounted
+          # at /blueprint (so nat + its deps install into a container-native venv),
+          # while the QA test harness + committed fixtures live at /app.
           docker run --rm \
             -e NVIDIA_API_KEY \
             -e QSD_CONFIG \
             -v "$(pwd):/blueprint" \
             "${QA_TEST_IMAGE}" bash -lc '
-              set -euo pipefail
+              set -uo pipefail
+
+              # ---- Phase 1: set up (deploy-equivalent) ----------------------
+              echo "::group::Set up blueprint (uv sync + dataset)"
+              # /blueprint is owned by the runner user but the container runs as
+              # root; allow git introspection during the editable build.
+              git config --global --add safe.directory /blueprint
               curl -LsSf https://astral.sh/uv/install.sh | sh
               export PATH="$HOME/.local/bin:$PATH"
-
               cd /blueprint
               uv sync --locked
-              # Download the S&P 500 price/volume dataset the workflow analyses.
               uv run python -m signal_discovery_workflow.download_data
+              echo "::endgroup::"
 
-              # Run from /blueprint so nat resolves the dataset, but point pytest at
-              # the /app test tree so it loads the harness conftest + options.
+              rc=0
+
+              # ---- Phase 2: CLI tests (live nat runs) ----------------------
+              echo "::group::CLI tests"
+              # cwd=/blueprint so nat resolves the dataset; point pytest at the
+              # /app test tree so it loads the harness conftest + options.
+              cd /blueprint
               pytest /app/testcases/quantitative_signal_discovery_agent \
                 -m "quantitative_signal_discovery_agent and cli" \
                 --nat-binary=/blueprint/.venv/bin/nat \
                 --qsd-config-optimization="/blueprint/${QSD_CONFIG}" \
                 --reruns=2 --reruns-delay=30 \
                 --disable-warnings -v --timeout=900 \
-                --html=/blueprint/qsd-cli-test.html --self-contained-html
+                --html=/blueprint/qsd-cli-test.html --self-contained-html || rc=1
+              echo "::endgroup::"
+
+              # ---- Phase 3: notebook tests (committed HTML fixture) --------
+              echo "::group::Notebook tests"
+              # cwd=/app so WORKSPACE_PATH resolves the committed fixture at
+              # /app/input/quantitative_signal_discovery_agent/*.html (static; no
+              # inference).
+              cd /app
+              pytest /app/testcases/quantitative_signal_discovery_agent \
+                -m "quantitative_signal_discovery_agent and notebook" \
+                --disable-warnings -v --timeout=120 \
+                --html=/blueprint/qsd-notebook-test.html --self-contained-html || rc=1
+              echo "::endgroup::"
+
+              exit $rc
             '
 
       - name: Capture failure diagnostics
         if: failure()
         run: |
           mkdir -p ci-diagnostics
-          # Any nat result JSONs the workflow saved during the run.
           cp -r src/signal_discovery_workflow/output ci-diagnostics/nat-output 2>/dev/null || true
 
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: quantitative-signal-discovery-cli-test
+          name: quantitative-signal-discovery-test
           path: |
             qsd-cli-test.html
+            qsd-notebook-test.html
             ci-diagnostics/
           if-no-files-found: ignore
           retention-days: 30
