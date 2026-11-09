@@ -100,8 +100,8 @@ jobs:
             -e NVIDIA_API_KEY \
             "$TEST_IMAGE" \
             pytest -m quantitative_signal_discovery_agent --disable-warnings \
-              --nat-binary "$GITHUB_WORKSPACE/.venv/bin/nat" \
-              --qsd-config-optimization "$GITHUB_WORKSPACE/configs/config-optimization-no-telemetry.yml" \
+              --nat-binary="$GITHUB_WORKSPACE/.venv/bin/nat" \
+              --qsd-config-optimization="$GITHUB_WORKSPACE/configs/config-optimization-no-telemetry.yml" \
               --html=/workspace/quantitative_signal_discovery_agent.html --self-contained-html
           test -s quantitative_signal_discovery_agent.html
 
