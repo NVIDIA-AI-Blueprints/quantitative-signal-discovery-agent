@@ -81,9 +81,14 @@ jobs:
       - name: Execute notebook
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          PHOENIX_SHIM_DIR: ${{ runner.temp }}/phoenix-shim
         run: |
-          uv run jupyter nbconvert --to html --execute --ExecutePreprocessor.timeout=1800 \
-            notebooks/signal-discovery-workflow.ipynb --output signal-discovery-workflow.html
+          set -euo pipefail
+          curl -sf http://localhost:6006 > /dev/null
+          mkdir -p "$PHOENIX_SHIM_DIR"
+          printf '#!/bin/sh\necho "phoenix: the Start Phoenix step already serves http://localhost:6006"\n' > "$PHOENIX_SHIM_DIR/phoenix"
+          chmod +x "$PHOENIX_SHIM_DIR/phoenix"
+          uv run bash -c 'PATH="$PHOENIX_SHIM_DIR:$PATH"; test "$(command -v phoenix)" = "$PHOENIX_SHIM_DIR/phoenix"; exec jupyter nbconvert --to html --execute --ExecutePreprocessor.timeout=1800 notebooks/signal-discovery-workflow.ipynb --output signal-discovery-workflow.html'
           test -s notebooks/signal-discovery-workflow.html
 
       - name: Run QA tests
