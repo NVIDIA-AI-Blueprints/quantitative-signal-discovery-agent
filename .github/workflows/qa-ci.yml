@@ -1,185 +1,142 @@
-# Runs the Quantitative Signal Discovery Agent QA suite (CLI + notebook) from the
-# shared QA image. This blueprint is pure Python (uv + nvidia-nat) and calls
-# hosted NVIDIA inference (build.nvidia.com); it has NO deployable server /
-# docker-compose stack, so its "deployment" is simply `uv sync` + dataset download.
-#
-# CLI and notebook run in a SINGLE container / SINGLE pytest session so the heavy
-# setup happens once (one image pull, one `uv sync`, one dataset download, one
-# editable install) instead of being duplicated per suite:
-#   1. CLI tests      - `nat run` for the four documented factor prompts, asserting
-#                       on each "Workflow Result:" payload.
-#   2. Notebook test  - execute the SHIPPED notebook
-#                       (notebooks/signal-discovery-workflow.ipynb) end-to-end with
-#                       nbconvert, export HTML, and assert on the executed cells.
-#                       This exercises the real notebook instead of a stale fixture.
-#                       The generated HTML is dropped into /app/input where the
-#                       harness notebook test expects it (the QA image ships no
-#                       input/ fixtures - the Dockerfile strips them).
-#
-# Required repository secrets:
-#   NVIDIA_API_KEY         build.nvidia.com API key (nvapi-...) used by nat.
-#   TEST_DOCKER_PULL_KEY   NVIDIA API key with pull access to the QA image.
-#                          If unset, the job is skipped.
-# Optional SMTP secrets (mail step skipped if any are missing):
-#   SMTP_USERNAME, SMTP_PASSWORD, SMTP_MAIL_TO, SMTP_MAIL_FROM
-#
-# Note: the QA image ':latest' is built from 'main', so the
-# quantitative_signal_discovery_agent tests + conftest options must be on main.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-name: Blueprint QA
+name: Quantitative Signal Discovery Agent QA
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
+    inputs:
+      test_image:
+        description: "blueprint-github-test image that runs the QA cases"
+        required: false
+        default: nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image:latest
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  quantitative-signal-discovery:
-    name: Quantitative Signal Discovery Agent
-    # No GPU needed (hosted inference). Swap to an org runner if registry /
-    # network access to nvcr.io requires a self-hosted runner.
+  qa:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-      QA_TEST_IMAGE: nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image:latest
-      # No-telemetry config: no Phoenix/OTLP exporter, so no localhost:6006
-      # connection-refused retries that slow the run and make nat exit non-zero.
-      QSD_CONFIG: configs/config-optimization-no-telemetry.yml
+      PYTHON_VERSION: "3.12"
+      TEST_IMAGE: ${{ inputs.test_image || 'nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image:latest' }}
+      NOTEBOOK_HTML: notebooks/signal-discovery-workflow.html
+      NOTEBOOK_EXECUTED: notebooks/signal-discovery-workflow.executed.ipynb
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
 
-      - name: Run Quantitative Signal Discovery tests (CLI + notebook)
+      - name: Check secrets
         env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
         run: |
           set -euo pipefail
-          : "${NVIDIA_API_KEY:?NVIDIA_API_KEY secret missing}"
-          [ -n "${TEST_DOCKER_PULL_KEY:-}" ] || { echo "TEST_DOCKER_PULL_KEY unset; skipping."; exit 0; }
-          echo "${TEST_DOCKER_PULL_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
-          docker pull "${QA_TEST_IMAGE}"
+          missing=0
+          if [ -z "${NVIDIA_API_KEY}" ]; then echo "::error::secret NVIDIA_API_KEY is not set"; missing=1; fi
+          if [ -z "${TEST_DOCKER_PULL_KEY}" ]; then echo "::error::secret TEST_DOCKER_PULL_KEY is not set"; missing=1; fi
+          exit "${missing}"
 
-          # One container for both suites. The blueprint checkout is mounted at
-          # /blueprint; the QA harness lives at /app inside the image. nat + its
-          # deps live in the same environment the tests use.
-          # Script is piped into the container via a quoted heredoc (bash -s), so
-          # any quoting/apostrophes inside it are worry-free. $HOME/$PATH and
-          # ${QSD_CONFIG}/$NVIDIA_API_KEY stay literal here and expand inside the
-          # container; $(pwd) is expanded by the runner for the bind mount.
-          docker run --rm -i \
-            -e NVIDIA_API_KEY \
-            -e QSD_CONFIG \
-            -v "$(pwd):/blueprint" \
-            "${QA_TEST_IMAGE}" bash -s <<'DOCKER_SCRIPT'
-          set -euo pipefail
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
 
-          # /blueprint is owned by the runner user but the container runs as root;
-          # allow git introspection during the editable build.
-          git config --global --add safe.directory /blueprint
+      - name: Set up Python
+        run: uv python install "${PYTHON_VERSION}"
 
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          export PATH="$HOME/.local/bin:$PATH"
+      - name: Install dependencies
+        run: uv sync --locked --extra test
 
-          cd /blueprint
-          # --extra test pulls the notebook toolchain the notebook itself uses; add
-          # nbconvert/ipykernel defensively in case they aren't in the lock.
-          uv sync --locked --extra test
-          uv pip install --quiet nbconvert nbclient ipykernel
-          uv run python -m ipykernel install --user --name python3 --display-name python3
-
-          # Download the S&P 500 dataset once (nat loads it via the editable package,
-          # so it resolves regardless of the test process cwd).
-          uv run python -m signal_discovery_workflow.download_data
-
-          # Execute the shipped notebook end-to-end and export HTML. --allow-errors
-          # keeps optional cells (e.g. the Phoenix UI helper) from aborting the run;
-          # the run cell still prints its "Workflow Result:" payload even if telemetry
-          # export fails, and the pytest assertion gates that result. The trailing
-          # "|| true" means a notebook hiccup doesn't block the CLI suite - the
-          # notebook cases fail clearly if the HTML is missing. The notebook self-syncs
-          # and chdirs to the repo root, so relative configs/ and src/ paths resolve.
-          uv run python -m nbconvert --to html --execute --allow-errors \
-            --ExecutePreprocessor.timeout=1800 \
-            --ExecutePreprocessor.kernel_name=python3 \
-            --output signal-discovery-workflow.html \
-            --output-dir /blueprint \
-            notebooks/signal-discovery-workflow.ipynb || true
-
-          # Drop the exported HTML where the harness notebook test expects it
-          # (WORKSPACE/input/...); WORKSPACE resolves to cwd = /app below.
-          mkdir -p /app/input/quantitative_signal_discovery_agent
-          cp /blueprint/signal-discovery-workflow.html \
-             /app/input/quantitative_signal_discovery_agent/signal-discovery-workflow.html || true
-
-          # Single pytest session for BOTH suites. Run from /app (harness root) so the
-          # conftest marker grep over testcases/ + data/ works. nat + config are
-          # absolute paths, so they work from any cwd.
-          cd /app
-          pytest testcases/quantitative_signal_discovery_agent \
-            -m "quantitative_signal_discovery_agent and (cli or notebook)" \
-            --nat-binary=/blueprint/.venv/bin/nat \
-            --qsd-config-optimization="/blueprint/${QSD_CONFIG}" \
-            --reruns=1 --reruns-delay=20 \
-            --disable-warnings -v --timeout=900 \
-            --html=/blueprint/qsd-test.html --self-contained-html
-          DOCKER_SCRIPT
-
-      - name: Capture failure diagnostics
-        if: failure()
+      - name: Download S&P 500 data
         run: |
-          mkdir -p ci-diagnostics
-          cp -r src/signal_discovery_workflow/output ci-diagnostics/nat-output 2>/dev/null || true
-          cp signal-discovery-workflow.html ci-diagnostics/ 2>/dev/null || true
+          set -euo pipefail
+          uv run --locked python -m signal_discovery_workflow.download_data
+          ls src/signal_discovery_workflow/data/sp500/*.csv
 
-      - name: Upload report
+      - name: Execute notebook
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: |
+          set -euo pipefail
+          uv run --locked jupyter nbconvert --to notebook --execute \
+            --ExecutePreprocessor.timeout=900 \
+            --ExecutePreprocessor.kernel_name=python3 \
+            --output signal-discovery-workflow.executed.ipynb \
+            notebooks/signal-discovery-workflow.ipynb
+          uv run --locked jupyter nbconvert --to html \
+            --output signal-discovery-workflow.html \
+            "${NOTEBOOK_EXECUTED}"
+          test -s "${NOTEBOOK_HTML}"
+
+      - name: Run QA tests
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
+        run: |
+          set -euo pipefail
+          echo "${TEST_DOCKER_PULL_KEY}" | docker login nvcr.io --username '$oauthtoken' --password-stdin
+          UV_PYTHON_DIR="$(uv python dir)"
+          docker run --rm \
+            -e NVIDIA_API_KEY \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" \
+            -v "${UV_PYTHON_DIR}:${UV_PYTHON_DIR}:ro" \
+            -v "${GITHUB_WORKSPACE}/${NOTEBOOK_HTML}:/app/input/quantitative_signal_discovery_agent/signal-discovery-workflow.html:ro" \
+            "${TEST_IMAGE}" \
+            pytest -m quantitative_signal_discovery_agent \
+              --nat-binary="${GITHUB_WORKSPACE}/.venv/bin/nat" \
+              --qsd-config-optimization="${GITHUB_WORKSPACE}/configs/config-optimization-no-telemetry.yml" \
+              --timeout=900 \
+              -rs \
+              --disable-warnings \
+              --html="${GITHUB_WORKSPACE}/qsd-test.html" --self-contained-html
+          test -s qsd-test.html
+
+      - name: Upload QA results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: quantitative-signal-discovery-test
+          name: qa-results
           path: |
+            notebooks/signal-discovery-workflow.html
+            notebooks/signal-discovery-workflow.executed.ipynb
             qsd-test.html
-            signal-discovery-workflow.html
-            ci-diagnostics/
-          if-no-files-found: ignore
+            src/signal_discovery_workflow/output/*.json
           retention-days: 30
 
-      - name: Cleanup
+      - name: Set result output
+        id: set_result
         if: always()
         run: |
-          docker rmi "${QA_TEST_IMAGE}" 2>/dev/null || true
-          docker image prune -f 2>/dev/null || true
-
-      - name: Detect SMTP
-        id: smtp
-        if: always()
-        env:
-          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          SMTP_MAIL_TO: ${{ secrets.SMTP_MAIL_TO }}
-          SMTP_MAIL_FROM: ${{ secrets.SMTP_MAIL_FROM }}
-        run: |
-          [ -n "${SMTP_USERNAME:-}${SMTP_PASSWORD:-}${SMTP_MAIL_TO:-}${SMTP_MAIL_FROM:-}" ] \
-            && [ -n "${SMTP_USERNAME:-}" ] && [ -n "${SMTP_PASSWORD:-}" ] \
-            && [ -n "${SMTP_MAIL_TO:-}" ] && [ -n "${SMTP_MAIL_FROM:-}" ] \
-            && echo "enabled=true" >> "$GITHUB_OUTPUT" \
-            || echo "enabled=false" >> "$GITHUB_OUTPUT"
+          echo "RESULT=$(if [ ${{ job.status }} == 'success' ]; then echo 'PASS'; else echo 'FAIL'; fi)" >> "$GITHUB_OUTPUT"
 
       - name: Send mail
-        if: always() && steps.smtp.outputs.enabled == 'true'
         uses: dawidd6/action-send-mail@6e71c855c9a091d80a519621b9fd3e8d252ca40c
-        continue-on-error: true
+        if: always()
         with:
           server_address: smtp.gmail.com
           server_port: 587
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
+
           subject: "QA Test Workflow Result for ${{ github.repository }}"
-          to: ${{ secrets.SMTP_MAIL_TO }}
-          from: ${{ secrets.SMTP_MAIL_FROM }}
+          to: Github-Action-Blueprint-QA@nvidia.com
+          from: github-workflow-notification@gmail.com
           html_body: |
-            <p>Workflow for <strong>${{ github.repository }}</strong> finished: <strong>${{ job.status }}</strong></p>
-            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View run</a></p>
+            <p>Hello,</p>
+
+            <p>The workflow for repository: <strong>${{ github.repository }}</strong> has completed.<br>
+            <strong>Result:</strong> ${{ steps.set_result.outputs.RESULT }}</p>
+
+            <p>You can review the details on GitHub:<br>
+            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}</a></p>
+
+            <p>Thanks!</p>
