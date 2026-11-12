@@ -65,6 +65,7 @@ jobs:
           set -euo pipefail
           uv run --locked jupyter nbconvert --to notebook --execute \
             --ExecutePreprocessor.timeout=1800 \
+            --ExecutePreprocessor.kernel_name=python3 \
             --output signal-discovery-workflow-executed.ipynb \
             notebooks/signal-discovery-workflow.ipynb
           uv run --locked jupyter nbconvert --to html \
