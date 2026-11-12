@@ -91,8 +91,8 @@ jobs:
             -v "$GITHUB_WORKSPACE/notebooks:/workspace" \
             "$TEST_IMAGE" \
             pytest -m quantitative_signal_discovery_agent --disable-warnings --timeout=900 \
-              --nat-binary "$GITHUB_WORKSPACE/.venv/bin/nat" \
-              --qsd-config-optimization "$GITHUB_WORKSPACE/configs/config-optimization-no-telemetry.yml" \
+              --nat-binary="$GITHUB_WORKSPACE/.venv/bin/nat" \
+              --qsd-config-optimization="$GITHUB_WORKSPACE/configs/config-optimization-no-telemetry.yml" \
               --html=/workspace/quantitative_signal_discovery_agent.html --self-contained-html
           test -s notebooks/quantitative_signal_discovery_agent.html
 
